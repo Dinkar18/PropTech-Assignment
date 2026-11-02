@@ -155,3 +155,77 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Architecture Overview
+
+The codebase follows a strict layered architecture to decouple HTTP handling, business logic, data persistence, and UI presentation:
+
+```
+api/
+├── migrations/
+│   └── 0001_init.sql           # D1 SQLite schema with 7 named integrity constraints
+└── src/
+    ├── domain/                 # Pure domain logic (zero side-effects)
+    │   ├── splitter.ts         # Deterministic remainder distribution & integer division
+    │   └── validation.ts       # Input parsers & centralized HttpError
+    ├── repositories/           # Isolated D1 database operations
+    │   ├── home.repository.ts
+    │   ├── bill.repository.ts
+    │   └── payment.repository.ts
+    ├── services/               # Orchestration, atomic batch writes & idempotency
+    │   ├── home.service.ts
+    │   ├── bill.service.ts
+    │   └── payment.service.ts
+    ├── routes/                 # Thin Hono route handlers
+    │   ├── homes.route.ts
+    │   ├── bills.route.ts
+    │   ├── payments.route.ts
+    │   └── balances.route.ts
+    ├── types/
+    │   └── models.ts           # Strongly typed domain entities
+    └── index.ts                # Composition root & global error handler
+
+web/
+└── src/
+    ├── types/
+    │   └── models.ts           # Shared frontend TypeScript interfaces
+    ├── lib/
+    │   ├── api.ts              # Typed client for Hono endpoints
+    │   └── formatters.ts       # Currency (₹), initials & avatar helpers
+    ├── components/
+    │   ├── Header.tsx          # Brand logo, property dropdown, flat creator
+    │   ├── HouseholdSummary.tsx# Balances breakdown & summary metrics
+    │   ├── BillsFeed.tsx       # Feed with progress bars & settlement status
+    │   ├── BillCard.tsx        # Single bill item with optimistic pay action
+    │   ├── SplitBillForm.tsx   # Bill creator with real-time split preview
+    │   ├── AddMemberForm.tsx   # Fast roommate onboarding form
+    │   ├── ToastContainer.tsx  # Floating toast notifications
+    │   └── GlobalErrorBanner.tsx
+    ├── routes/
+    │   └── index.tsx           # Clean orchestrating route component
+    └── app.css                 # Fintech styling, elevation & responsive layout
+```
+
+## Decisions
+
+### 1. Explicit Sequential Ordering (`order_idx`) and Atomic Batch Transactions
+
+- **Decision:** Rather than relying on implicit SQLite `rowid` ordering or timestamps (which can suffer from millisecond collisions during rapid inserts), each member in a home and each share in a bill is assigned an explicit integer `order_idx`. When creating a bill, the bill record and all computed member shares are written atomically using `c.env.DB.batch(...)`.
+- **Why:** The bill-splitting specification strictly requires extra remainder cents to be distributed to members in the exact order they joined, and balances to be reported in that same order. Explicit indexing guarantees deterministic, collision-free member ordering. Atomic batching ensures that a bill and its shares are written together, preventing orphan bills or partial share allocation if a failure occurs mid-write.
+
+### 2. Atomic Idempotent Payments via Conditional Update and Re-fetch Reconciliation
+
+- **Decision:** Payment processing uses an atomic conditional SQL write: `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND paid_at IS NULL`, coupled with a database-level `UNIQUE` constraint on `idempotency_key`. If 0 rows are updated, the handler reads the current state to differentiate between an idempotent retry (same key returns `200` with the original `paidAt`) and a concurrent/duplicate conflict (different key returns `409`).
+- **Why:** This design eliminates race conditions when two concurrent requests try to pay the same share simultaneously. Only one request can transition `paid_at` from `NULL` to a timestamp. Subsequent or duplicate requests with the exact same `Idempotency-Key` are served safely without double charging or altering timestamps.
+
+### 3. Defensive Schema Integrity with 7 Named Constraints
+
+- **Decision:** Instead of relying solely on API validation, the SQLite schema enforces business invariants at the database level using 7 explicit named constraints:
+  1. `fk_members_home_id`: `FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE` (prevents orphan members).
+  2. `fk_bills_home_id`: `FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE` (prevents orphan bills).
+  3. `chk_bills_total_cents_positive`: `CHECK (total_cents > 0)` (prevents zero or negative bill totals).
+  4. `fk_shares_bill_id`: `FOREIGN KEY (bill_id) REFERENCES bills(id) ON DELETE CASCADE` (prevents orphan shares).
+  5. `fk_shares_member_id`: `FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE` (prevents shares from referencing non-existent members).
+  6. `chk_shares_amount_cents_positive`: `CHECK (amount_cents > 0)` (guarantees split amounts are strictly positive).
+  7. `uq_shares_idempotency_key`: `UNIQUE (idempotency_key)` (prevents idempotency key collisions across payments).
+- **Why:** Financial calculations demand defensive programming. Enforcing constraints at the database boundary guarantees database consistency regardless of network quirks, concurrency, or future API refactors.
